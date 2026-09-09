@@ -1,0 +1,205 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Thermometer</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, sans-serif; margin: 20px; max-width: 960px;
+         background: #fff; color: #111; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .card { border: 1px solid #ccc; border-radius: 6px; padding: 12px 16px; min-width: 260px; }
+  .big { font-size: 64px; font-weight: 700; line-height: 1.1; }
+  .bad { color: #b00; font-size: 28px; font-weight: 700; line-height: 1.1; padding: 18px 0; }
+  .name { font-size: 14px; color: #555; }
+  button { font-size: 14px; padding: 6px 10px; cursor: pointer; }
+  canvas { border: 1px solid #ccc; margin-top: 16px; width: 100%; max-width: 920px; height: auto; }
+  fieldset { margin-top: 16px; border: 1px solid #ccc; border-radius: 6px; }
+  label { display: inline-block; margin: 4px 12px 4px 0; font-size: 14px; }
+  input { font-size: 14px; padding: 3px; }
+  input[type=text] { width: 260px; }
+  input[type=number] { width: 80px; }
+  #msg { font-size: 14px; margin-left: 8px; }
+  #log { font-size: 13px; color: #444; white-space: pre-line; margin-top: 8px; }
+  .sim { font-size: 13px; color: #555; margin-top: 12px; }
+</style>
+
+<h1>Thermometer &mdash; ECE:4880 Lab 1
+  <button id="unit">show &deg;F</button>
+  <span id="conn"></span>
+</h1>
+
+<div class="row">
+  <div class="card">
+    <div class="name">Sensor A</div>
+    <div id="valA" class="big">--</div>
+    <button id="dispA">display: ?</button>
+  </div>
+  <div class="card">
+    <div class="name">Sensor B</div>
+    <div id="valB" class="big">--</div>
+    <button id="dispB">display: ?</button>
+  </div>
+</div>
+
+<canvas id="chart" width="920" height="320"></canvas>
+<div class="name">
+  <span style="color:#06c">&#9632;</span> A &nbsp;
+  <span style="color:#e60">&#9632;</span> B &nbsp;
+  <span style="color:#b00">&#9632;</span> outside chart range (clamped) &nbsp;
+  gap = no data
+</div>
+
+<fieldset>
+  <legend>Alerts</legend>
+  <label>min <input type="number" id="min" step="0.1"> <span class="u"></span></label>
+  <label>max <input type="number" id="max" step="0.1"> <span class="u"></span></label><br>
+  <label>low message <input type="text" id="msgLow"></label><br>
+  <label>high message <input type="text" id="msgHigh"></label><br>
+  <label>send to <input type="text" id="dest" placeholder="you@example.com or 3195551234@vtext.com"></label>
+  <button id="save">Save</button><span id="msg"></span>
+  <div id="log"></div>
+</fieldset>
+
+<div class="sim">
+  Simulator (stands in for the box until the hardware exists):
+  <button id="simBox">box power</button>
+  <button id="simA">unplug A</button>
+  <button id="simB">unplug B</button>
+</div>
+
+<script>
+const WINDOW = 300, LO_C = 10, HI_C = 50;   // chart band, never autoscales
+let useF = false, last = null, editing = false;
+
+const c2f = c => c * 9 / 5 + 32;
+const f2c = f => (f - 32) * 5 / 9;
+const disp = c => useF ? c2f(c) : c;        // C on the wire, convert only for display
+
+// ---- polling -------------------------------------------------------------
+async function poll() {
+  try {
+    const d = await (await fetch('/api/data')).json();
+    last = d;
+    document.getElementById('conn').textContent = '';
+    render(d);
+  } catch (e) {
+    document.getElementById('conn').textContent = ' (backend unreachable)';
+  }
+}
+
+function render(d) {
+  for (const s of ['a', 'b']) {
+    const el = document.getElementById('val' + s.toUpperCase());
+    const st = d[s].status;
+    if (!d.box_on || st === 'off') { el.className = 'bad'; el.textContent = 'no data available'; }
+    else if (st !== 'ok')          { el.className = 'bad'; el.textContent = 'unplugged sensor'; }
+    else { el.className = 'big'; el.textContent = disp(d[s].value).toFixed(1) + (useF ? ' °F' : ' °C'); }
+    document.getElementById('disp' + s.toUpperCase()).textContent =
+      'display: ' + (d[s].display_on ? 'ON' : 'OFF');
+  }
+  if (!editing) {
+    document.getElementById('min').value = disp(d.settings.min_c).toFixed(1);
+    document.getElementById('max').value = disp(d.settings.max_c).toFixed(1);
+    document.getElementById('msgLow').value = d.settings.msg_low;
+    document.getElementById('msgHigh').value = d.settings.msg_high;
+    document.getElementById('dest').value = d.settings.destination;
+  }
+  document.getElementById('log').textContent = d.alerts.slice(0, 3)
+    .map(a => new Date(a.t * 1000).toLocaleTimeString() + '  ' + a.text).join('\n');
+  drawChart(d.history);
+}
+
+// ---- chart ---------------------------------------------------------------
+function drawChart(hist) {
+  const cv = document.getElementById('chart'), g = cv.getContext('2d');
+  const L = 55, R = 15, T = 12, B = 34;
+  const W = cv.width - L - R, H = cv.height - T - B;
+  const x = ago => L + (WINDOW - ago) / WINDOW * W;        // 300 s ago at left, now at right
+  const y = c => T + (HI_C - Math.min(HI_C, Math.max(LO_C, c))) / (HI_C - LO_C) * H;
+
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.strokeStyle = '#ddd'; g.fillStyle = '#444'; g.font = '12px system-ui';
+  g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (let c = LO_C; c <= HI_C; c += 5) {                  // fixed 10-50 C / 50-122 F
+    g.beginPath(); g.moveTo(L, y(c)); g.lineTo(L + W, y(c)); g.stroke();
+    g.fillText(disp(c).toFixed(0), L - 6, y(c));
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  for (let a = WINDOW; a >= 0; a -= 60) {
+    g.beginPath(); g.moveTo(x(a), T); g.lineTo(x(a), T + H); g.stroke();
+    g.fillText(a, x(a), T + H + 6);
+  }
+  g.strokeStyle = '#999'; g.strokeRect(L, T, W, H);
+  g.fillText('seconds ago', L + W / 2, T + H + 20);
+  g.save(); g.translate(14, T + H / 2); g.rotate(-Math.PI / 2);
+  g.fillText(useF ? '°F' : '°C', 0, 0); g.restore();
+
+  for (const [s, color] of [['a', '#06c'], ['b', '#e60']]) {
+    const pts = hist[s], n = pts.length;
+    g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
+    let pen = false;
+    for (let i = 0; i < n; i++) {
+      const ago = n - 1 - i;                                // one sample per second
+      if (pts[i].v === null) { pen = false; continue; }      // gap: never connect across
+      const px = x(ago), py = y(pts[i].v);
+      pen ? g.lineTo(px, py) : g.moveTo(px, py);
+      pen = true;
+    }
+    g.stroke();
+    g.fillStyle = '#b00';                                    // valid but off the chart band
+    for (let i = 0; i < n; i++) {
+      const v = pts[i].v;
+      if (v === null || (v >= LO_C && v <= HI_C)) continue;
+      g.fillRect(x(n - 1 - i) - 1.5, y(v) - 3, 3, 6);
+    }
+  }
+}
+
+// ---- controls ------------------------------------------------------------
+const post = (url, body) =>
+  fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify(body) });
+
+document.getElementById('unit').onclick = () => {
+  useF = !useF;
+  document.getElementById('unit').textContent = useF ? 'show °C' : 'show °F';
+  document.querySelectorAll('.u').forEach(e => e.textContent = useF ? '°F' : '°C');
+  if (last) render(last);
+};
+
+for (const s of ['a', 'b']) {
+  document.getElementById('disp' + s.toUpperCase()).onclick = async () => {
+    await post('/api/display', { sensor: s, on: !last[s].display_on });
+    poll();                                   // reflect it immediately, not next tick
+  };
+}
+
+document.querySelectorAll('fieldset input').forEach(el => {
+  el.onfocus = () => editing = true;
+  el.onblur = () => editing = false;
+});
+
+document.getElementById('save').onclick = async () => {
+  const num = id => parseFloat(document.getElementById(id).value);
+  const body = {
+    min_c: useF ? f2c(num('min')) : num('min'),
+    max_c: useF ? f2c(num('max')) : num('max'),
+    msg_low: document.getElementById('msgLow').value,
+    msg_high: document.getElementById('msgHigh').value,
+    destination: document.getElementById('dest').value,
+  };
+  const r = await post('/api/settings', body), j = await r.json();
+  editing = false;
+  document.getElementById('msg').textContent = r.ok ? 'saved' : ('error: ' + j.error);
+  setTimeout(() => document.getElementById('msg').textContent = '', 3000);
+  poll();
+};
+
+document.getElementById('simBox').onclick = () => post('/api/sim', { box_on: !last.sim.box_on }).then(poll);
+document.getElementById('simA').onclick = () => post('/api/sim', { a_plugged: !last.sim.a_plugged }).then(poll);
+document.getElementById('simB').onclick = () => post('/api/sim', { b_plugged: !last.sim.b_plugged }).then(poll);
+
+document.querySelectorAll('.u').forEach(e => e.textContent = '°C');
+poll();
+setInterval(poll, 1000);
+</script>
